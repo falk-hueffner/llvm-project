@@ -1895,11 +1895,39 @@ Instruction *InstCombinerImpl::foldICmpAndConstant(ICmpInst &Cmp,
     return new ICmpInst(NewPred, X, SubOne(cast<Constant>(Cmp.getOperand(1))));
   }
 
+  const APInt *C2;
+  if (!And->hasOneUse() || !match(Y, m_APInt(C2)))
+    return nullptr;
+
+  // If C2 is the negation of a power of two, or equivalently,
+  // C2 is of the form 1*0* (e.g. 11100000), then for some values of C,
+  // we can fold this into a signed comparison with a constant.
+  // TODO: As in the next block, this can be extended to the case
+  // 0*1*0* where the block of 1's starts with the sign bit of a legal
+  // integer type.
+  if ((*C2 | (*C2 << 1)) == *C2) {
+    assert((-*C2).isPowerOf2());
+    assert(!C2->isZero() && !C2->isAllOnesValue());
+    const APInt SignMask = APInt::getSignMask(C.getBitWidth());
+    if (C.isSignMask()) {
+      // e.g. (X & 0b11100000) == 0b10000000  -->  x <=s 0b10011111
+      Constant *T = ConstantInt::get(X->getType(), ~(*C2) | SignMask);
+      auto NewPred =
+          Pred == CmpInst::ICMP_EQ ? CmpInst::ICMP_SLE : CmpInst::ICMP_SGT;
+      return new ICmpInst(NewPred, X, T);
+    }
+    if (C == (*C2 & ~SignMask)) {
+      // e.g. (X & 0b11100000) == 0b01100000  -->  x >=s 0b01100000
+      auto NewPred =
+          Pred == CmpInst::ICMP_EQ ? CmpInst::ICMP_SGE : CmpInst::ICMP_SLT;
+      return new ICmpInst(NewPred, X, Cmp.getOperand(1));
+    }
+  }
+
   // (X & C2) == 0 -> (trunc X) >= 0
   // (X & C2) != 0 -> (trunc X) <  0
   //   iff C2 is a power of 2 and it masks the sign bit of a legal integer type.
-  const APInt *C2;
-  if (And->hasOneUse() && C.isNullValue() && match(Y, m_APInt(C2))) {
+  if (C.isNullValue()) {
     int32_t ExactLogBase2 = C2->exactLogBase2();
     if (ExactLogBase2 != -1 && DL.isLegalInteger(ExactLogBase2 + 1)) {
       Type *NTy = IntegerType::get(Cmp.getContext(), ExactLogBase2 + 1);
